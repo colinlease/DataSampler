@@ -3,6 +3,18 @@ import pandas as pd
 import numpy as np
 import os
 import io
+from filehub_app import upload_dataframe
+from filehub_app import download_dataframe
+
+# Sanity check for AWS credentials (for Streamlit Cloud)
+AWS_ACCESS_KEY_ID = st.secrets.get("AWS_ACCESS_KEY_ID", os.getenv("AWS_ACCESS_KEY_ID"))
+AWS_SECRET_ACCESS_KEY = st.secrets.get("AWS_SECRET_ACCESS_KEY", os.getenv("AWS_SECRET_ACCESS_KEY"))
+S3_BUCKET_NAME = st.secrets.get("S3_BUCKET_NAME", os.getenv("S3_BUCKET_NAME"))
+S3_REGION = st.secrets.get("S3_REGION", os.getenv("S3_REGION", "us-east-1"))
+
+if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, S3_REGION]):
+    st.error("Missing AWS credentials or S3 configuration. Please check your Streamlit secrets.")
+    st.stop()
 
 # Constants
 MAX_FILE_SIZE_MB = 200
@@ -37,7 +49,7 @@ def reset_app():
 uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
 
 # Automatically reset everything if file is removed
-if uploaded_file is None and st.session_state.get("df") is not None:
+if uploaded_file is None and st.session_state.get("df") is not None and st.session_state.get("uploaded_file") is not None:
     reset_app()
 
 if uploaded_file is not None:
@@ -71,14 +83,42 @@ if uploaded_file is not None:
 
             st.success("File uploaded successfully!")
 
+            if df.columns[-1] == "DS_SAMPLE":
+                sample_val = df["DS_SAMPLE"].iloc[0]
+                if sample_val.startswith("Sampled["):
+                    try:
+                        parts = sample_val.strip("Sampled[]").split("][")
+                        sample_type = parts[0]
+                        sample_counts = parts[1].split("/")
+                        sample_rows = int(sample_counts[0])
+                        original_rows = int(sample_counts[1])
+                        pct = round(sample_rows / original_rows * 100, 2)
+                        st.warning(
+                            f"**⚠️ Sampled Data Detected**\n\n"
+                            f"- Sample type: {sample_type}\n"
+                            f"- Original size: {original_rows}\n"
+                            f"- Sample size: {sample_rows}\n"
+                            f"- Coverage: {pct}%"
+                        )
+                    except Exception as e:
+                        st.info("Note: A 'DS_SAMPLE' column was found but could not be parsed.")
+
         except Exception as e:
             st.error(f"Error reading file: {e}")
             st.stop()
 else:
     st.session_state.uploaded_file = None
 
-if st.session_state.get("df") is not None:
+if st.session_state.get("df") is not None and st.session_state.get("file_info"):
     df = st.session_state.get("df")
+    row_count = df.shape[0]
+else:
+    df = None
+
+if st.session_state.pop("filehub_success", False):
+    st.success("✅ File loaded from FileHub successfully!")
+
+if df is not None:
     row_count = df.shape[0]
 
     sample_type = st.selectbox("Select sampling method", ["Random", "Stratified", "Systematic"])
@@ -121,9 +161,20 @@ if st.session_state.get("df") is not None:
                     step = max(1, row_count // sample_size)
                     sampled_df = df.iloc[::step].head(sample_size)
 
-                # Add DS_SAMPLE column
+                # Add DS_SAMPLE column (keeping previous as history)
+                sampled_df = sampled_df.copy()
+                existing_sample_cols = [col for col in sampled_df.columns if col.startswith("DS_SAMPLE")]
+
+                for i, col in enumerate(existing_sample_cols, 1):
+                    sampled_df.rename(columns={col: f"DS_SAMPLE_{i}"}, inplace=True)
+
                 tag = f"Sampled[{sample_type}][{len(sampled_df)}/{row_count}]"
                 sampled_df["DS_SAMPLE"] = tag
+
+                # Ensure DS_SAMPLE is the last column
+                ds_cols = [col for col in sampled_df.columns if col.startswith("DS_SAMPLE")]
+                other_cols = [col for col in sampled_df.columns if not col.startswith("DS_SAMPLE")]
+                sampled_df = sampled_df[other_cols + ds_cols]
 
                 # Update session
                 st.session_state.sampled_df = sampled_df
@@ -135,23 +186,72 @@ if st.session_state.get("df") is not None:
                 }
 
                 st.success("Sampling completed successfully!")
-                st.dataframe(sampled_df.head(20), use_container_width=True)
 
-                # Download
-                csv_buffer = io.StringIO()
-                sampled_df.to_csv(csv_buffer, index=False)
-                csv_bytes = csv_buffer.getvalue().encode("utf-8")
-                st.download_button(
-                    label="⬇️ Download Sampled File",
-                    data=csv_bytes,
-                    file_name=f"sampled_{uploaded_file.name.split('.')[0]}.csv",
-                    mime="text/csv"
-                )
             except Exception as e:
                 st.error(f"Sampling failed: {e}")
 
+if st.session_state.get("sampled_df") is not None:
+    sampled_df = st.session_state.get("sampled_df")
+    st.dataframe(sampled_df.head(20), use_container_width=True)
+
+    if st.button("📤 Send to FileHub"):
+        try:
+            st.warning("📡 Uploading to FileHub...")
+            token = upload_dataframe(sampled_df, source_app="DataSampler", original_filename="sampled_output.csv")
+            st.success(f"✅ File sent to FileHub! Transfer Token: `{token}`")
+            st.info("You can now use this token in DataWizard, DataBlender, or any other app.")
+        except Exception as e:
+            st.error("❌ Upload to FileHub failed.")
+            st.exception(e)
+
 # Sidebar (render at end after session state is set)
 with st.sidebar:
+    st.markdown("## 🔁 FileHub")
+    transfer_token = st.text_input("Enter transfer token to load file from FileHub")
+    if st.button("Submit token") and transfer_token.strip():
+        try:
+            df_from_filehub, original_filename = download_dataframe(transfer_token.strip())
+            st.session_state.df = df_from_filehub
+            st.session_state.uploaded_file = None
+            st.session_state.sampled_df = None
+            st.session_state.sample_info = {}
+
+            st.session_state.file_info = {
+                "name": original_filename,
+                "size_mb": round(df_from_filehub.memory_usage(deep=True).sum() / (1024 * 1024), 2),
+                "rows": df_from_filehub.shape[0],
+                "cols": df_from_filehub.shape[1],
+                "missing": df_from_filehub.isnull().sum().sum()
+            }
+
+            st.session_state.filehub_success = True
+            st.rerun()
+        except Exception as e:
+            st.error("❌ Error retrieving file from FileHub.")
+            st.exception(e)
+
+    if st.session_state.get("df") is not None:
+        cols = st.session_state.df.columns
+        if cols[-1] == "DS_SAMPLE":
+            sample_val = st.session_state.df["DS_SAMPLE"].iloc[0]
+            if sample_val.startswith("Sampled["):
+                try:
+                    parts = sample_val.strip("Sampled[]").split("][")
+                    sample_type = parts[0]
+                    sample_counts = parts[1].split("/")
+                    sample_rows = int(sample_counts[0])
+                    original_rows = int(sample_counts[1])
+                    pct = round(sample_rows / original_rows * 100, 2)
+                    st.warning(
+                        f"**⚠️ Sampled Data Detected**\n\n"
+                        f"- Sample type: {sample_type}\n"
+                        f"- Original size: {original_rows}\n"
+                        f"- Sample size: {sample_rows}\n"
+                        f"- Coverage: {pct}%"
+                    )
+                except Exception as e:
+                    st.info("Note: A 'DS_SAMPLE' column was found but could not be parsed.")
+
     st.markdown("## 📊 SampleStats")
 
     if st.session_state.get("df") is not None and st.session_state.get("file_info"):

@@ -252,8 +252,6 @@ with st.sidebar:
                 except Exception as e:
                     st.info("Note: A 'DS_SAMPLE' column was found but could not be parsed.")
 
-    st.markdown("## 📊 SampleStats")
-
     if st.session_state.get("df") is not None and st.session_state.get("file_info"):
         file_info = st.session_state.get("file_info")
         st.markdown("### 📁 File Summary")
@@ -263,7 +261,8 @@ with st.sidebar:
         st.write(f"**Columns:** {file_info.get('cols')}")
         st.write(f"**Missing Fields:** {file_info.get('missing')}")
 
-    if st.session_state.get("df") is not None and st.session_state.get("sample_info"):
+    if st.session_state.get("sample_info"):
+        st.markdown("## 📊 SampleStats")
         sample_info = st.session_state.get("sample_info")
         st.markdown("### 🧪 Sampling Summary")
         st.write(f"**Original Rows:** {sample_info.get('original_rows')}")
